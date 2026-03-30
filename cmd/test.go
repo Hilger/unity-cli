@@ -80,7 +80,7 @@ func pollTestResults(port int) (*client.CommandResponse, error) {
 	}
 
 	resultsPath := filepath.Join(home, ".unity-cli", "status", fmt.Sprintf("test-results-%d.json", port))
-	deadline := time.Now().Add(10 * time.Minute)
+	deadline := time.Now().Add(30 * time.Minute)
 
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)

@@ -26,13 +26,35 @@ namespace UnityCliConnector
             EditorApplication.update += Tick;
             EditorApplication.quitting += Cleanup;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-            AssemblyReloadEvents.afterAssemblyReload += () => { if (!s_Testing) s_ForcedState = null; s_LastWrite = 0; };
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
+        }
+
+        static void OnAfterAssemblyReload()
+        {
+            s_LastWrite = 0;
+            // Check if tests were running before reload (pending file exists)
+            try
+            {
+                var statusDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "status");
+                if (Directory.Exists(statusDir) &&
+                    Directory.GetFiles(statusDir, "test-pending-*.json").Length > 0)
+                {
+                    s_Testing = true;
+                    s_ForcedState = "testing";
+                    return;
+                }
+            }
+            catch { }
+
+            s_ForcedState = null;
         }
 
         static void OnBeforeAssemblyReload()
         {
-            WriteState("reloading");
+            // Preserve testing state across reload by writing "testing" not "reloading"
+            WriteState(s_Testing ? "testing" : "reloading");
         }
 
         static void OnPlayModeChanged(PlayModeStateChange change)

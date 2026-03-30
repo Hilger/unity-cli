@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using UnityEditor;
 using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
 using Object = UnityEngine.Object;
@@ -15,6 +16,11 @@ namespace UnityCliConnector.TestRunner
     {
         internal static readonly string StatusDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "status");
+
+        // SessionState keys — survive domain reloads within a Unity session
+        const string SK_PASSED  = "UnityCliConnector_TestPassed";
+        const string SK_FAILED  = "UnityCliConnector_TestFailed";
+        const string SK_SKIPPED = "UnityCliConnector_TestSkipped";
 
         public class Parameters
         {
@@ -58,36 +64,90 @@ namespace UnityCliConnector.TestRunner
         {
             var port = HttpServer.Port;
 
-            // Clean up any stale results
+            // Clean up stale results and session state
             try { var f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
+            ClearSessionResults();
 
-            // Mark pending (survives domain reloads for PlayMode)
+            // Mark pending (survives domain reloads)
             TestRunnerState.MarkPending(port, filter, mode);
 
             // Signal heartbeat so CLI knows Unity is busy with tests
             Heartbeat.SetTestingState(true);
 
-            var passed  = new List<string>();
-            var failed  = new List<string>();
-            var skipped = new List<string>();
+            RegisterCallbacksWithSessionAccumulation(port);
+        }
 
+        /// <summary>
+        /// Registers test callbacks that accumulate results in SessionState.
+        /// SessionState survives domain reloads within a Unity session, so results
+        /// from tests that ran before a reload are preserved.
+        /// </summary>
+        internal static void RegisterCallbacksWithSessionAccumulation(int port)
+        {
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new TestCallbacks(
-                onResult: r => CollectResult(r, passed, failed, skipped),
+                onResult: r => CollectResultToSession(r),
                 onFinished: _ =>
                 {
                     Object.DestroyImmediate(api);
+
+                    // Read accumulated results from SessionState
+                    var passed  = LoadSessionList(SK_PASSED);
+                    var failed  = LoadSessionList(SK_FAILED);
+                    var skipped = LoadSessionList(SK_SKIPPED);
+
                     TestRunnerState.ClearPending(port);
+                    ClearSessionResults();
                     WriteResultsFile(port, passed, failed, skipped);
                     Heartbeat.SetTestingState(false);
                 }
             );
 
             api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
         }
 
-        // --- Shared helpers (used by TestRunnerState after domain reload) ---
+        // --- SessionState accumulation (survives domain reloads) ---
+
+        static void CollectResultToSession(ITestResultAdaptor result)
+        {
+            if (result.Test.IsSuite) return;
+            var name = result.Test.FullName;
+            switch (result.TestStatus)
+            {
+                case TestStatus.Passed:
+                    AppendToSessionList(SK_PASSED, name);
+                    break;
+                case TestStatus.Failed:
+                    AppendToSessionList(SK_FAILED, $"{name}: {result.Message}");
+                    break;
+                default:
+                    AppendToSessionList(SK_SKIPPED, name);
+                    break;
+            }
+        }
+
+        static void AppendToSessionList(string key, string value)
+        {
+            var list = LoadSessionList(key);
+            list.Add(value);
+            SessionState.SetString(key, JsonConvert.SerializeObject(list));
+        }
+
+        internal static List<string> LoadSessionList(string key)
+        {
+            var json = SessionState.GetString(key, "[]");
+            try { return JsonConvert.DeserializeObject<List<string>>(json) ?? new List<string>(); }
+            catch { return new List<string>(); }
+        }
+
+        static void ClearSessionResults()
+        {
+            SessionState.EraseString(SK_PASSED);
+            SessionState.EraseString(SK_FAILED);
+            SessionState.EraseString(SK_SKIPPED);
+        }
+
+        // --- Shared helpers ---
 
         internal static void CollectResult(ITestResultAdaptor result,
             List<string> passed, List<string> failed, List<string> skipped)

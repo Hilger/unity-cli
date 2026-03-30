@@ -1,19 +1,16 @@
-using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
-using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
-using Object = UnityEngine.Object;
 
 namespace UnityCliConnector.TestRunner
 {
     /// <summary>
     /// Survives domain reloads via [InitializeOnLoad].
-    /// Re-registers TestRunnerApi callbacks after domain reload
-    /// so RunFinished still fires and results are written to file.
-    /// Works for both EditMode and PlayMode tests.
+    /// After each domain reload, checks for pending test runs and re-registers
+    /// callbacks so RunFinished fires and results are written to file.
+    /// Results are accumulated in SessionState across reloads.
     /// </summary>
     [InitializeOnLoad]
     public static class TestRunnerState
@@ -23,7 +20,7 @@ namespace UnityCliConnector.TestRunner
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
         }
 
-        public static void MarkPending(int port, string filter, TestMode mode)
+        public static void MarkPending(int port, string filter, UnityEditor.TestTools.TestRunner.Api.TestMode mode)
         {
             var pending = new { port, filter = filter ?? "", mode = mode.ToString() };
             try
@@ -48,43 +45,25 @@ namespace UnityCliConnector.TestRunner
         {
             try
             {
-                Directory.CreateDirectory(RunTests.StatusDir);
+                if (!Directory.Exists(RunTests.StatusDir)) return;
+
                 foreach (var file in Directory.GetFiles(RunTests.StatusDir, "test-pending-*.json"))
                 {
                     var json = File.ReadAllText(file);
                     var pending = JObject.Parse(json);
-                    var port   = pending["port"]?.Value<int>() ?? 0;
-                    var filter = pending["filter"]?.Value<string>();
+                    var port = pending["port"]?.Value<int>() ?? 0;
 
                     if (port == 0) continue;
 
-                    // Re-register callbacks and restore heartbeat state
+                    // Restore heartbeat testing state (s_Testing was lost during reload)
                     Heartbeat.SetTestingState(true);
-                    ReattachCallbacks(port, filter);
+
+                    // Re-register callbacks using SessionState accumulation
+                    // Results collected before this reload are already in SessionState
+                    RunTests.RegisterCallbacksWithSessionAccumulation(port);
                 }
             }
             catch { }
-        }
-
-        static void ReattachCallbacks(int port, string filter)
-        {
-            var passed  = new List<string>();
-            var failed  = new List<string>();
-            var skipped = new List<string>();
-
-            var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-            var callbacks = new RunTests.TestCallbacks(
-                onResult: r => RunTests.CollectResult(r, passed, failed, skipped),
-                onFinished: _ =>
-                {
-                    Object.DestroyImmediate(api);
-                    ClearPending(port);
-                    RunTests.WriteResultsFile(port, passed, failed, skipped);
-                    Heartbeat.SetTestingState(false);
-                }
-            );
-
-            api.RegisterCallbacks(callbacks);
         }
 
         static string PendingFilePath(int port) =>
