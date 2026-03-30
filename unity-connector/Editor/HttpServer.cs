@@ -1,10 +1,6 @@
 using System;
-using System.Collections.Concurrent;
-using System.IO;
-using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
@@ -13,230 +9,123 @@ using UnityEngine;
 namespace UnityCliConnector
 {
     /// <summary>
-    /// Lightweight HTTP server on localhost. Receives CLI commands as POST /command,
-    /// dispatches via CommandRouter, returns JSON responses.
-    /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling
-    /// so commands execute even when Unity is unfocused.
-    /// Survives domain reloads via InitializeOnLoad.
+    /// Managed bridge to the native TCP server plugin.
+    /// The native plugin (native_server.c) holds the listening socket permanently —
+    /// it survives domain reloads because native plugins are never unloaded.
+    /// This class polls for buffered requests on EditorApplication.update,
+    /// dispatches them to CommandRouter, and sends responses back through native.
     /// </summary>
     [InitializeOnLoad]
     public static class HttpServer
     {
-        const int DEFAULT_PORT = 8090;
-        const int MAX_PORT_ATTEMPTS = 10;
+        const string LIB = "native_server";
+        const int REQUEST_BUFFER_SIZE = 256 * 1024;
 
-        static HttpListener s_Listener;
-        static CancellationTokenSource s_Cts;
-        static int s_Port;
+        [DllImport(LIB)] static extern int native_server_get_port();
+        [DllImport(LIB)] static extern int native_server_is_running();
+        [DllImport(LIB)] static extern int native_server_get_request_count();
+        [DllImport(LIB)] static extern int native_server_get_pending_request(byte[] buffer, int bufferSize);
+        [DllImport(LIB)] static extern int native_server_send_response(int slotId, byte[] json, int jsonLen);
+        [DllImport(LIB)] static extern int native_server_send_error(int slotId, int statusCode, byte[] json, int jsonLen);
 
-        static readonly ConcurrentQueue<WorkItem> s_Queue = new();
-
-        struct WorkItem
-        {
-            public string Command;
-            public JObject Parameters;
-            public TaskCompletionSource<object> Tcs;
-        }
+        static bool s_Registered;
 
         static HttpServer()
         {
-            Start();
-            EditorApplication.quitting += Stop;
-            AssemblyReloadEvents.beforeAssemblyReload += StopListener;
-            AssemblyReloadEvents.afterAssemblyReload += Start;
-            EditorApplication.projectChanged += Restart;
-            EditorApplication.update += ProcessQueue;
+            Register();
         }
 
-        static void Restart()
+        static void Register()
         {
-            StopListener();
-            Start();
+            if (s_Registered) return;
+            s_Registered = true;
+            EditorApplication.update += PollNative;
+
+            var port = Port;
+            if (port > 0)
+                Debug.Log($"[UnityCliConnector] Native HTTP server on port {port}");
+            else
+                Debug.LogWarning("[UnityCliConnector] Native server not running — plugin may not be loaded");
         }
 
-        public static int Port => s_Port;
-
-        static void Start()
+        /// <summary>Port the native server is listening on (0 if not running).</summary>
+        public static int Port
         {
-            if (s_Listener != null) return;
-
-            for (var attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++)
+            get
             {
-                var port = DEFAULT_PORT + attempt;
-                try
-                {
-                    var listener = new HttpListener();
-                    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
-                    listener.Start();
-
-                    s_Listener = listener;
-                    s_Port = port;
-                    s_Cts = new CancellationTokenSource();
-
-                    _ = ListenLoop(s_Cts.Token);
-
-                    Debug.Log($"[UnityCliConnector] HTTP server started on port {port}");
-                    return;
-                }
-                catch (HttpListenerException)
-                {
-                    // Port in use, try next
-                }
-                catch (System.Net.Sockets.SocketException)
-                {
-                    // Windows/Mono throws SocketException instead of HttpListenerException
-                }
+                try { return native_server_get_port(); }
+                catch { return 0; }
             }
-
-            Debug.LogError("[UnityCliConnector] Failed to start HTTP server — no available port");
         }
 
-        static void StopListener()
+        /// <summary>
+        /// Called ~60x/sec by EditorApplication.update.
+        /// Dequeues one request per frame from the native buffer and processes it.
+        /// </summary>
+        static void PollNative()
         {
-            if (s_Listener == null) return;
-
-            s_Cts?.Cancel();
-            s_Cts?.Dispose();
-            s_Cts = null;
-
             try
             {
-                s_Listener.Stop();
-                s_Listener.Close();
+                if (native_server_is_running() == 0) return;
+                if (native_server_get_request_count() == 0) return;
             }
             catch
             {
+                return; // native plugin not loaded yet
             }
 
-            s_Listener = null;
+            var buffer = new byte[REQUEST_BUFFER_SIZE];
+            int slotId = native_server_get_pending_request(buffer, buffer.Length);
+            if (slotId == 0) return;
+
+            // Parse the JSON body
+            string bodyStr = Encoding.UTF8.GetString(buffer).TrimEnd('\0');
+
+            ProcessRequest(slotId, bodyStr);
         }
 
-        static void Stop()
+        static async void ProcessRequest(int slotId, string body)
         {
-            var port = s_Port;
-            StopListener();
-            Debug.Log($"[UnityCliConnector] HTTP server stopped (was port {port})");
-        }
-
-        static void ForceEditorUpdate()
-        {
-            try { UnityEditorInternal.InternalEditorUtility.RepaintAllViews(); }
-            catch { }
-        }
-
-        static void ProcessQueue()
-        {
-            while (s_Queue.TryDequeue(out var item))
-                ProcessItem(item);
-        }
-
-        static async void ProcessItem(WorkItem item)
-        {
-            try
-            {
-                var r = await CommandRouter.Dispatch(item.Command, item.Parameters);
-                item.Tcs.SetResult(r);
-            }
-            catch (Exception ex)
-            {
-                item.Tcs.SetResult(new ErrorResponse(ex.Message));
-            }
-        }
-
-        static async Task ListenLoop(CancellationToken ct)
-        {
-            while (ct.IsCancellationRequested == false && s_Listener?.IsListening == true)
-            {
-                try
-                {
-                    var context = await s_Listener.GetContextAsync();
-                    _ = HandleRequest(context);
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-                catch (HttpListenerException)
-                {
-                    break;
-                }
-            }
-        }
-
-        static async Task HandleRequest(HttpListenerContext context)
-        {
-            var request = context.Request;
-            var response = context.Response;
-
-            response.ContentType = "application/json";
-
-            // Block browser cross-origin requests — CLI uses Go HTTP client (not subject to CORS)
-            if (request.HttpMethod == "OPTIONS")
-            {
-                response.StatusCode = 204;
-                response.Close();
-                return;
-            }
-
-            var origin = request.Headers["Origin"];
-            if (origin != null)
-            {
-                response.StatusCode = 403;
-                var buf = Encoding.UTF8.GetBytes("{\"error\":\"Browser requests are not allowed\"}");
-                response.ContentLength64 = buf.Length;
-                await response.OutputStream.WriteAsync(buf, 0, buf.Length);
-                response.Close();
-                return;
-            }
-
             object result;
+            int statusCode = 200;
 
             try
             {
-                if (request.HttpMethod != "POST" || request.Url.AbsolutePath != "/command")
+                var json = JObject.Parse(body);
+                var command = json["command"]?.ToString();
+                var parameters = json["params"] as JObject;
+
+                if (string.IsNullOrEmpty(command))
                 {
-                    result = new ErrorResponse($"Expected POST /command, got {request.HttpMethod} {request.Url.AbsolutePath}");
-                    response.StatusCode = 400;
+                    result = new ErrorResponse("Missing 'command' field");
+                    statusCode = 400;
                 }
                 else
                 {
-                    using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
-                    var body = await reader.ReadToEndAsync();
-                    var json = JObject.Parse(body);
-
-                    var command = json["command"]?.ToString();
-                    var parameters = json["params"] as JObject;
-
-                    if (string.IsNullOrEmpty(command))
-                    {
-                        result = new ErrorResponse("Missing 'command' field");
-                        response.StatusCode = 400;
-                    }
-                    else
-                    {
-                        var tcs = new TaskCompletionSource<object>();
-                        s_Queue.Enqueue(new WorkItem
-                        {
-                            Command = command,
-                            Parameters = parameters,
-                            Tcs = tcs,
-                        });
-                        ForceEditorUpdate();
-                        result = await tcs.Task;
-                    }
+                    result = await CommandRouter.Dispatch(command, parameters);
                 }
             }
             catch (Exception ex)
             {
                 result = new ErrorResponse($"Request error: {ex.Message}");
-                response.StatusCode = 500;
+                statusCode = 500;
             }
 
+            // Serialize and send response
             var responseJson = JsonConvert.SerializeObject(result);
-            var buffer = Encoding.UTF8.GetBytes(responseJson);
-            response.ContentLength64 = buffer.Length;
-            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-            response.Close();
+            var responseBytes = Encoding.UTF8.GetBytes(responseJson);
+
+            try
+            {
+                if (statusCode == 200)
+                    native_server_send_response(slotId, responseBytes, responseBytes.Length);
+                else
+                    native_server_send_error(slotId, statusCode, responseBytes, responseBytes.Length);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[UnityCliConnector] Failed to send response for slot {slotId}: {ex.Message}");
+            }
         }
     }
 }
