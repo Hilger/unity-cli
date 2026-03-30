@@ -11,8 +11,9 @@ namespace UnityCliConnector.TestRunner
 {
     /// <summary>
     /// Survives domain reloads via [InitializeOnLoad].
-    /// Re-registers TestRunnerApi callbacks after PlayMode domain reload
+    /// Re-registers TestRunnerApi callbacks after domain reload
     /// so RunFinished still fires and results are written to file.
+    /// Works for both EditMode and PlayMode tests.
     /// </summary>
     [InitializeOnLoad]
     public static class TestRunnerState
@@ -22,9 +23,9 @@ namespace UnityCliConnector.TestRunner
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
         }
 
-        public static void MarkPending(int port, string filter)
+        public static void MarkPending(int port, string filter, TestMode mode)
         {
-            var pending = new { port, filter = filter ?? "" };
+            var pending = new { port, filter = filter ?? "", mode = mode.ToString() };
             try
             {
                 Directory.CreateDirectory(RunTests.StatusDir);
@@ -57,6 +58,8 @@ namespace UnityCliConnector.TestRunner
 
                     if (port == 0) continue;
 
+                    // Re-register callbacks and restore heartbeat state
+                    Heartbeat.SetTestingState(true);
                     ReattachCallbacks(port, filter);
                 }
             }
@@ -77,6 +80,7 @@ namespace UnityCliConnector.TestRunner
                     Object.DestroyImmediate(api);
                     ClearPending(port);
                     RunTests.WriteResultsFile(port, passed, failed, skipped);
+                    Heartbeat.SetTestingState(false);
                 }
             );
 

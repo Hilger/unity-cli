@@ -19,13 +19,14 @@ namespace UnityCliConnector
         static string s_ForcedState;
         static double s_CompileRequestTime;
         static string s_FilePath;
+        static bool s_Testing;
 
         static Heartbeat()
         {
             EditorApplication.update += Tick;
             EditorApplication.quitting += Cleanup;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-            AssemblyReloadEvents.afterAssemblyReload += () => { s_ForcedState = null; s_LastWrite = 0; };
+            AssemblyReloadEvents.afterAssemblyReload += () => { if (!s_Testing) s_ForcedState = null; s_LastWrite = 0; };
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
         }
 
@@ -44,6 +45,22 @@ namespace UnityCliConnector
         {
             s_ForcedState = state;
             Write();
+        }
+
+        /// <summary>
+        /// Sets or clears the "testing" state. While true, heartbeat reports "testing"
+        /// so the CLI knows Unity is busy running tests (not unresponsive).
+        /// </summary>
+        public static void SetTestingState(bool testing)
+        {
+            s_Testing = testing;
+            if (testing)
+                WriteState("testing");
+            else
+            {
+                s_ForcedState = null;
+                Write();
+            }
         }
 
         /// <summary>
@@ -74,7 +91,7 @@ namespace UnityCliConnector
                 s_CompileRequestTime = 0;
             }
 
-            s_ForcedState = null;
+            if (!s_Testing) s_ForcedState = null;
             Write();
         }
 
@@ -114,6 +131,7 @@ namespace UnityCliConnector
 
         static string GetState()
         {
+            if (s_Testing) return "testing";
             if (EditorApplication.isCompiling) return "compiling";
             if (EditorApplication.isUpdating) return "refreshing";
             if (EditorApplication.isPlaying)

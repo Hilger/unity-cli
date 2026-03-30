@@ -57,17 +57,13 @@ func testCmd(args []string, send sendFn, port int) (*client.CommandResponse, err
 				"  Window > Package Manager > search 'Test Framework' > Install")
 	}
 
-	// EditMode: results returned directly in response
-	if mode == "EditMode" {
-		return resp, nil
-	}
-
-	// PlayMode: Unity returns "running", poll results file
+	// Both modes: if Unity returned results directly, use them.
+	// If "running", poll the results file (async execution).
 	if resp.Message != "running" {
 		return resp, nil
 	}
 
-	fmt.Fprintln(os.Stderr, "PlayMode tests running, waiting for results...")
+	fmt.Fprintf(os.Stderr, "%s tests running, waiting for results...\n", mode)
 
 	// Suppress "Unsolicited response received on idle HTTP channel" during domain reload
 	original := log.Writer()

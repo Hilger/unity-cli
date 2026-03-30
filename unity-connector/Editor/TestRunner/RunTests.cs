@@ -47,42 +47,25 @@ namespace UnityCliConnector.TestRunner
 
             var filter = p.Get("filter", null);
 
-            if (testMode == TestMode.EditMode)
-                return ExecuteInProcess(testMode, filter);
-
-            StartPlayModeRun(filter);
+            // Both modes use fire-and-forget: return immediately, write results to file.
+            // This prevents EditMode tests from blocking the HTTP response (which caused
+            // "connection closed before response" when tests took longer than the CLI timeout).
+            StartAsyncRun(testMode, filter);
             return Task.FromResult<object>(new SuccessResponse("running", new { port = HttpServer.Port }));
         }
 
-        private static Task<object> ExecuteInProcess(TestMode mode, string filter)
-        {
-            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var passed  = new List<string>();
-            var failed  = new List<string>();
-            var skipped = new List<string>();
-
-            var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-            var callbacks = new TestCallbacks(
-                onResult: r => CollectResult(r, passed, failed, skipped),
-                onFinished: _ =>
-                {
-                    if (tcs.Task.IsCompleted) return;
-                    Object.DestroyImmediate(api);
-                    tcs.TrySetResult(BuildResponse(passed, failed, skipped));
-                }
-            );
-
-            api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
-            return tcs.Task;
-        }
-
-        private static void StartPlayModeRun(string filter)
+        private static void StartAsyncRun(TestMode mode, string filter)
         {
             var port = HttpServer.Port;
 
+            // Clean up any stale results
             try { var f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
-            TestRunnerState.MarkPending(port, filter);
+
+            // Mark pending (survives domain reloads for PlayMode)
+            TestRunnerState.MarkPending(port, filter, mode);
+
+            // Signal heartbeat so CLI knows Unity is busy with tests
+            Heartbeat.SetTestingState(true);
 
             var passed  = new List<string>();
             var failed  = new List<string>();
@@ -96,11 +79,12 @@ namespace UnityCliConnector.TestRunner
                     Object.DestroyImmediate(api);
                     TestRunnerState.ClearPending(port);
                     WriteResultsFile(port, passed, failed, skipped);
+                    Heartbeat.SetTestingState(false);
                 }
             );
 
             api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(TestMode.PlayMode, filter)));
+            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
         }
 
         // --- Shared helpers (used by TestRunnerState after domain reload) ---
@@ -120,7 +104,32 @@ namespace UnityCliConnector.TestRunner
 
         internal static void WriteResultsFile(int port, List<string> passed, List<string> failed, List<string> skipped)
         {
-            var data = new
+            var json = JsonConvert.SerializeObject(BuildResultsData(passed, failed, skipped), Formatting.Indented);
+
+            // Global status dir (for CLI polling)
+            try
+            {
+                Directory.CreateDirectory(StatusDir);
+                File.WriteAllText(ResultsFilePath(port), json);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[UnityCliConnector] Failed to write test results: {ex.Message}");
+            }
+
+            // Project-local (for tools like Claude Code to read directly via file path)
+            try
+            {
+                var projectLogs = Path.Combine(Application.dataPath, "..", "Logs");
+                Directory.CreateDirectory(projectLogs);
+                File.WriteAllText(Path.Combine(projectLogs, "TestResults.json"), json);
+            }
+            catch { }
+        }
+
+        internal static object BuildResultsData(List<string> passed, List<string> failed, List<string> skipped)
+        {
+            return new
             {
                 success = failed.Count == 0,
                 message = failed.Count > 0
@@ -136,16 +145,6 @@ namespace UnityCliConnector.TestRunner
                     passes   = passed,
                 }
             };
-
-            try
-            {
-                Directory.CreateDirectory(StatusDir);
-                File.WriteAllText(ResultsFilePath(port), JsonConvert.SerializeObject(data));
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[UnityCliConnector] Failed to write test results: {ex.Message}");
-            }
         }
 
         internal static string ResultsFilePath(int port) =>
