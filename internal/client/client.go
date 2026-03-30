@@ -139,6 +139,30 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 	return &best, nil
 }
 
+// heartbeatState reads the heartbeat file for the given port and returns
+// the current state string. Returns "" if heartbeat can't be read.
+func heartbeatState(port int) string {
+	inst, err := FindByPort(port)
+	if err != nil {
+		return ""
+	}
+	age := time.Since(time.UnixMilli(inst.Timestamp))
+	if age > 10*time.Second {
+		return "" // stale heartbeat
+	}
+	return inst.State
+}
+
+// isTransientState returns true if the heartbeat state indicates Unity is
+// temporarily busy and will recover (domain reload, compilation, testing).
+func isTransientState(state string) bool {
+	switch state {
+	case "reloading", "compiling", "refreshing", "testing", "entering_playmode":
+		return true
+	}
+	return false
+}
+
 func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
 	if params == nil {
 		params = map[string]interface{}{}
@@ -150,40 +174,71 @@ func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*C
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/command", inst.Port)
-	httpClient := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
 
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("cannot connect to Unity at port %d: %v", inst.Port, err)
-	}
-	defer resp.Body.Close()
+	// Retry loop: if Unity is in a transient state (reloading, testing),
+	// the HTTP server may be briefly down. Retry instead of failing immediately.
+	maxRetries := 6
+	retryDelay := 2 * time.Second
 
-	if resp.StatusCode != http.StatusOK {
-		var body []byte
-		body, _ = io.ReadAll(resp.Body)
-		if len(body) > 0 {
-			return nil, fmt.Errorf("HTTP %d from Unity: %s", resp.StatusCode, string(body))
+	for attempt := 0; ; attempt++ {
+		httpClient := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+		resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+
+		if err != nil {
+			// Connection failed — check heartbeat to see if Unity is just busy
+			state := heartbeatState(inst.Port)
+			if isTransientState(state) && attempt < maxRetries {
+				fmt.Fprintf(os.Stderr, "Unity is %s, retrying in %s...\n", state, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+			if state != "" {
+				return nil, fmt.Errorf("cannot connect to Unity (state: %s): %v", state, err)
+			}
+			return nil, fmt.Errorf("cannot connect to Unity at port %d: %v", inst.Port, err)
 		}
-		return nil, fmt.Errorf("HTTP %d from Unity (command: %s)", resp.StatusCode, command)
-	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil || len(respBody) == 0 {
-		// Some commands (e.g. play mode entry) close the connection before responding.
-		return &CommandResponse{
-			Success: true,
-			Message: fmt.Sprintf("%s sent (connection closed before response)", command),
-		}, nil
-	}
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(respBody) > 0 {
+				return nil, fmt.Errorf("HTTP %d from Unity: %s", resp.StatusCode, string(respBody))
+			}
+			return nil, fmt.Errorf("HTTP %d from Unity (command: %s)", resp.StatusCode, command)
+		}
 
-	var result CommandResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		// Unity sent a non-JSON body — treat as plain message.
-		return &CommandResponse{
-			Success: true,
-			Message: string(respBody),
-		}, nil
-	}
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-	return &result, nil
+		if err != nil || len(respBody) == 0 {
+			// Empty response — check heartbeat for context
+			state := heartbeatState(inst.Port)
+			if isTransientState(state) && attempt < maxRetries {
+				fmt.Fprintf(os.Stderr, "Unity is %s, retrying in %s...\n", state, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+			if state != "" {
+				return &CommandResponse{
+					Success: true,
+					Message: fmt.Sprintf("%s sent (Unity is %s — response unavailable)", command, state),
+				}, nil
+			}
+			return &CommandResponse{
+				Success: true,
+				Message: fmt.Sprintf("%s sent (connection closed before response)", command),
+			}, nil
+		}
+
+		var result CommandResponse
+		if err := json.Unmarshal(respBody, &result); err != nil {
+			// Unity sent a non-JSON body — treat as plain message.
+			return &CommandResponse{
+				Success: true,
+				Message: string(respBody),
+			}, nil
+		}
+
+		return &result, nil
+	}
 }
