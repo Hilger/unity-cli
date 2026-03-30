@@ -18,9 +18,8 @@ namespace UnityCliConnector.TestRunner
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "status");
 
         // SessionState keys — survive domain reloads within a Unity session
-        const string SK_PASSED  = "UnityCliConnector_TestPassed";
-        const string SK_FAILED  = "UnityCliConnector_TestFailed";
-        const string SK_SKIPPED = "UnityCliConnector_TestSkipped";
+        const string SK_TESTS     = "UnityCliConnector_Tests";      // JSON array of test entry objects
+        const string SK_STARTED   = "UnityCliConnector_TestStarted"; // ISO timestamp
 
         public class Parameters
         {
@@ -54,8 +53,6 @@ namespace UnityCliConnector.TestRunner
             var filter = p.Get("filter", null);
 
             // Both modes use fire-and-forget: return immediately, write results to file.
-            // This prevents EditMode tests from blocking the HTTP response (which caused
-            // "connection closed before response" when tests took longer than the CLI timeout).
             StartAsyncRun(testMode, filter);
             return Task.FromResult<object>(new SuccessResponse("running", new { port = HttpServer.Port }));
         }
@@ -66,39 +63,42 @@ namespace UnityCliConnector.TestRunner
 
             // Clean up stale results and session state
             try { var f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
-            ClearSessionResults();
+            ClearSessionState();
+
+            // Record start time
+            SessionState.SetString(SK_STARTED, DateTime.UtcNow.ToString("o"));
 
             // Mark pending (survives domain reloads)
             TestRunnerState.MarkPending(port, filter, mode);
 
-            // Signal heartbeat so CLI knows Unity is busy with tests
+            // Signal heartbeat
             Heartbeat.SetTestingState(true);
+
+            // Write initial progress file
+            WriteProgressFile("running");
 
             RegisterCallbacksWithSessionAccumulation(port);
         }
 
         /// <summary>
-        /// Registers test callbacks that accumulate results in SessionState.
-        /// SessionState survives domain reloads within a Unity session, so results
-        /// from tests that ran before a reload are preserved.
+        /// Registers test callbacks that accumulate results in SessionState
+        /// and write incremental progress to Logs/TestResults.json after each test.
         /// </summary>
         internal static void RegisterCallbacksWithSessionAccumulation(int port)
         {
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new TestCallbacks(
-                onResult: r => CollectResultToSession(r),
+                onResult: r =>
+                {
+                    CollectResultToSession(r);
+                    WriteProgressFile("running");
+                },
                 onFinished: _ =>
                 {
                     Object.DestroyImmediate(api);
-
-                    // Read accumulated results from SessionState
-                    var passed  = LoadSessionList(SK_PASSED);
-                    var failed  = LoadSessionList(SK_FAILED);
-                    var skipped = LoadSessionList(SK_SKIPPED);
-
                     TestRunnerState.ClearPending(port);
-                    ClearSessionResults();
-                    WriteResultsFile(port, passed, failed, skipped);
+                    WriteFinalResults(port);
+                    ClearSessionState();
                     Heartbeat.SetTestingState(false);
                 }
             );
@@ -111,120 +111,158 @@ namespace UnityCliConnector.TestRunner
         static void CollectResultToSession(ITestResultAdaptor result)
         {
             if (result.Test.IsSuite) return;
-            var name = result.Test.FullName;
-            switch (result.TestStatus)
+
+            var entry = new JObject
             {
-                case TestStatus.Passed:
-                    AppendToSessionList(SK_PASSED, name);
-                    break;
-                case TestStatus.Failed:
-                    AppendToSessionList(SK_FAILED, $"{name}: {result.Message}");
-                    break;
-                default:
-                    AppendToSessionList(SK_SKIPPED, name);
-                    break;
-            }
+                ["name"]     = result.Test.FullName,
+                ["status"]   = result.TestStatus.ToString().ToLower(),
+                ["duration"] = Math.Round(result.Duration, 4)
+            };
+            if (result.TestStatus == TestStatus.Failed)
+                entry["message"] = result.Message ?? "";
+
+            var tests = LoadSessionTests();
+            tests.Add(entry);
+            SessionState.SetString(SK_TESTS, tests.ToString(Formatting.None));
         }
 
-        static void AppendToSessionList(string key, string value)
+        static JArray LoadSessionTests()
         {
-            var list = LoadSessionList(key);
-            list.Add(value);
-            SessionState.SetString(key, JsonConvert.SerializeObject(list));
+            var json = SessionState.GetString(SK_TESTS, "[]");
+            try { return JArray.Parse(json); }
+            catch { return new JArray(); }
         }
 
-        internal static List<string> LoadSessionList(string key)
+        static void ClearSessionState()
         {
-            var json = SessionState.GetString(key, "[]");
-            try { return JsonConvert.DeserializeObject<List<string>>(json) ?? new List<string>(); }
-            catch { return new List<string>(); }
+            SessionState.EraseString(SK_TESTS);
+            SessionState.EraseString(SK_STARTED);
         }
 
-        static void ClearSessionResults()
-        {
-            SessionState.EraseString(SK_PASSED);
-            SessionState.EraseString(SK_FAILED);
-            SessionState.EraseString(SK_SKIPPED);
-        }
+        // --- File output ---
 
-        // --- Shared helpers ---
-
-        internal static void CollectResult(ITestResultAdaptor result,
-            List<string> passed, List<string> failed, List<string> skipped)
+        /// <summary>
+        /// Writes incremental progress to the project-local Logs/TestResults.json.
+        /// Called after each test completes so external tools can read mid-run.
+        /// </summary>
+        static void WriteProgressFile(string status)
         {
-            if (result.Test.IsSuite) return;
-            var name = result.Test.FullName;
-            switch (result.TestStatus)
+            var tests = LoadSessionTests();
+            var startedStr = SessionState.GetString(SK_STARTED, null);
+
+            int passed = 0, failed = 0, skipped = 0;
+            foreach (var t in tests)
             {
-                case TestStatus.Passed:  passed.Add(name); break;
-                case TestStatus.Failed:  failed.Add($"{name}: {result.Message}"); break;
-                default:                 skipped.Add(name); break;
+                var s = t["status"]?.ToString();
+                if (s == "passed") passed++;
+                else if (s == "failed") failed++;
+                else skipped++;
             }
+
+            var data = new JObject
+            {
+                ["status"]    = status,
+                ["startedAt"] = startedStr,
+                ["summary"] = new JObject
+                {
+                    ["passed"]  = passed,
+                    ["failed"]  = failed,
+                    ["skipped"] = skipped,
+                    ["total"]   = tests.Count
+                },
+                ["tests"] = tests
+            };
+
+            try
+            {
+                var projectLogs = Path.Combine(Application.dataPath, "..", "Logs");
+                Directory.CreateDirectory(projectLogs);
+                File.WriteAllText(
+                    Path.Combine(projectLogs, "TestResults.json"),
+                    data.ToString(Formatting.Indented));
+            }
+            catch { }
         }
 
-        internal static void WriteResultsFile(int port, List<string> passed, List<string> failed, List<string> skipped)
+        /// <summary>
+        /// Writes final results to both the CLI polling path and the project-local path.
+        /// </summary>
+        static void WriteFinalResults(int port)
         {
-            var json = JsonConvert.SerializeObject(BuildResultsData(passed, failed, skipped), Formatting.Indented);
+            var tests = LoadSessionTests();
+            var startedStr = SessionState.GetString(SK_STARTED, null);
 
-            // Global status dir (for CLI polling)
+            int passed = 0, failed = 0, skipped = 0;
+            var failures = new List<string>();
+            var passes = new List<string>();
+
+            foreach (var t in tests)
+            {
+                var name = t["name"]?.ToString() ?? "";
+                var s = t["status"]?.ToString();
+                if (s == "passed") { passed++; passes.Add(name); }
+                else if (s == "failed") { failed++; failures.Add($"{name}: {t["message"]}"); }
+                else skipped++;
+            }
+
+            // CLI polling file (legacy format expected by Go CLI)
+            var cliData = new
+            {
+                success = failed == 0,
+                message = failed > 0
+                    ? $"{failed} test(s) failed."
+                    : $"All {passed} test(s) passed.",
+                data = new
+                {
+                    total    = tests.Count,
+                    passed,
+                    failed,
+                    skipped,
+                    failures,
+                    passes,
+                }
+            };
+
             try
             {
                 Directory.CreateDirectory(StatusDir);
-                File.WriteAllText(ResultsFilePath(port), json);
+                File.WriteAllText(ResultsFilePath(port),
+                    JsonConvert.SerializeObject(cliData));
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[UnityCliConnector] Failed to write test results: {ex.Message}");
             }
 
-            // Project-local (for tools like Claude Code to read directly via file path)
+            // Project-local: full granular format with per-test entries
+            var projectData = new JObject
+            {
+                ["status"]      = "completed",
+                ["startedAt"]   = startedStr,
+                ["completedAt"] = DateTime.UtcNow.ToString("o"),
+                ["summary"] = new JObject
+                {
+                    ["passed"]  = passed,
+                    ["failed"]  = failed,
+                    ["skipped"] = skipped,
+                    ["total"]   = tests.Count
+                },
+                ["tests"] = tests
+            };
+
             try
             {
                 var projectLogs = Path.Combine(Application.dataPath, "..", "Logs");
                 Directory.CreateDirectory(projectLogs);
-                File.WriteAllText(Path.Combine(projectLogs, "TestResults.json"), json);
+                File.WriteAllText(
+                    Path.Combine(projectLogs, "TestResults.json"),
+                    projectData.ToString(Formatting.Indented));
             }
             catch { }
         }
 
-        internal static object BuildResultsData(List<string> passed, List<string> failed, List<string> skipped)
-        {
-            return new
-            {
-                success = failed.Count == 0,
-                message = failed.Count > 0
-                    ? $"{failed.Count} test(s) failed."
-                    : $"All {passed.Count} test(s) passed.",
-                data = new
-                {
-                    total   = passed.Count + failed.Count + skipped.Count,
-                    passed  = passed.Count,
-                    failed  = failed.Count,
-                    skipped = skipped.Count,
-                    failures = failed,
-                    passes   = passed,
-                }
-            };
-        }
-
         internal static string ResultsFilePath(int port) =>
             Path.Combine(StatusDir, $"test-results-{port}.json");
-
-        internal static object BuildResponse(List<string> passed, List<string> failed, List<string> skipped)
-        {
-            var summary = new
-            {
-                total   = passed.Count + failed.Count + skipped.Count,
-                passed  = passed.Count,
-                failed  = failed.Count,
-                skipped = skipped.Count,
-                failures = failed,
-                passes   = passed,
-            };
-            return failed.Count > 0
-                ? (object)new ErrorResponse($"{failed.Count} test(s) failed.", summary)
-                : new SuccessResponse($"All {passed.Count} test(s) passed.", summary);
-        }
 
         internal static Filter BuildFilter(TestMode mode, string filterStr)
         {
