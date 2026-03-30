@@ -10,7 +10,7 @@ SRC = native_server.c
 CFLAGS = -shared -fPIC -O2 -Wall -Wextra -Wno-unused-parameter
 
 # macOS: universal .dylib inside a .bundle
-BUNDLE = native_server.bundle
+BUNDLE = ../unity-connector/Plugins/native_server.bundle
 DYLIB_ARM64 = build/native_server_arm64.dylib
 DYLIB_X86   = build/native_server_x86_64.dylib
 DYLIB_UNI   = $(BUNDLE)/Contents/MacOS/native_server
