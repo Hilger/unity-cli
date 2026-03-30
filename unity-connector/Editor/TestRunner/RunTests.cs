@@ -59,10 +59,10 @@ namespace UnityCliConnector.TestRunner
 
         private static void StartAsyncRun(TestMode mode, string filter)
         {
-            var port = HttpServer.Port;
+            int port = HttpServer.Port;
 
             // Clean up stale results and session state
-            try { var f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
+            try { string f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
             ClearSessionState();
 
             // Record start time
@@ -77,17 +77,24 @@ namespace UnityCliConnector.TestRunner
             // Write initial progress file
             WriteProgressFile("running");
 
-            RegisterCallbacksWithSessionAccumulation(port);
+            // Register callbacks and execute tests
+            TestRunnerApi api = RegisterCallbacksWithSessionAccumulation(port);
+            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
         }
 
         /// <summary>
         /// Registers test callbacks that accumulate results in SessionState
         /// and write incremental progress to Logs/TestResults.json after each test.
         /// </summary>
-        internal static void RegisterCallbacksWithSessionAccumulation(int port)
+        /// <summary>
+        /// Creates a TestRunnerApi, registers callbacks that accumulate results in SessionState,
+        /// and returns the api instance so the caller can optionally call Execute().
+        /// After domain reloads, TestRunnerState calls this WITHOUT Execute — just re-registers callbacks.
+        /// </summary>
+        internal static TestRunnerApi RegisterCallbacksWithSessionAccumulation(int port)
         {
-            var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-            var callbacks = new TestCallbacks(
+            TestRunnerApi api = ScriptableObject.CreateInstance<TestRunnerApi>();
+            TestCallbacks callbacks = new TestCallbacks(
                 onResult: r =>
                 {
                     CollectResultToSession(r);
@@ -104,6 +111,7 @@ namespace UnityCliConnector.TestRunner
             );
 
             api.RegisterCallbacks(callbacks);
+            return api;
         }
 
         // --- SessionState accumulation (survives domain reloads) ---
