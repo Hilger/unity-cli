@@ -51,13 +51,14 @@ namespace UnityCliConnector.TestRunner
                 return Task.FromResult<object>(new ErrorResponse($"Unknown mode '{modeStr}'. Use EditMode or PlayMode."));
 
             var filter = p.Get("filter", null);
+            var assembly = p.Get("assembly", null);
 
             // Both modes use fire-and-forget: return immediately, write results to file.
-            StartAsyncRun(testMode, filter);
+            StartAsyncRun(testMode, filter, assembly);
             return Task.FromResult<object>(new SuccessResponse("running", new { port = HttpServer.Port }));
         }
 
-        private static void StartAsyncRun(TestMode mode, string filter)
+        private static void StartAsyncRun(TestMode mode, string filter, string assembly = null)
         {
             int port = HttpServer.Port;
 
@@ -79,7 +80,7 @@ namespace UnityCliConnector.TestRunner
 
             // Register callbacks and execute tests
             TestRunnerApi api = RegisterCallbacksWithSessionAccumulation(port);
-            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
+            api.Execute(new ExecutionSettings(BuildFilter(mode, filter, assembly)));
         }
 
         /// <summary>
@@ -272,13 +273,18 @@ namespace UnityCliConnector.TestRunner
         internal static string ResultsFilePath(int port) =>
             Path.Combine(StatusDir, $"test-results-{port}.json");
 
-        internal static Filter BuildFilter(TestMode mode, string filterStr)
+        internal static Filter BuildFilter(TestMode mode, string filterStr, string assemblyStr = null)
         {
             var f = new Filter { testMode = mode };
             if (!string.IsNullOrEmpty(filterStr))
             {
                 f.testNames  = new[] { filterStr };
                 f.groupNames = new[] { filterStr };
+            }
+            if (!string.IsNullOrEmpty(assemblyStr))
+            {
+                // Support comma-separated assembly names, e.g. "NeonHorizon.Tests.DOTS,NeonHorizon.Tests.UI"
+                f.assemblyNames = assemblyStr.Split(',');
             }
             return f;
         }
