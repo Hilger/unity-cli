@@ -283,9 +283,14 @@ namespace UnityCliConnector.TestRunner
             }
             if (!string.IsNullOrEmpty(assemblyStr))
             {
-                // Support comma-separated assembly names, e.g. "NeonHorizon.Tests.DOTS,NeonHorizon.Tests.UI"
                 f.assemblyNames = assemblyStr.Split(',');
+                Debug.Log($"[UnityCliConnector] Assembly filter set: [{string.Join(", ", f.assemblyNames)}]");
             }
+            else
+            {
+                Debug.Log("[UnityCliConnector] No assembly filter — running all tests");
+            }
+            Debug.Log($"[UnityCliConnector] Filter: {f}");
             return f;
         }
 
