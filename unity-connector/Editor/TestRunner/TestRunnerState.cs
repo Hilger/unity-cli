@@ -58,9 +58,9 @@ namespace UnityCliConnector.TestRunner
                     // Restore heartbeat testing state (s_Testing was lost during reload)
                     Heartbeat.SetTestingState(true);
 
-                    // Re-register callbacks using SessionState accumulation
-                    // Results collected before this reload are already in SessionState
-                    RunTests.RegisterCallbacksWithSessionAccumulation(port);
+                    // Re-register callbacks using native data accumulation
+                    // Results collected before this reload are in native memory
+                    RunTests.RegisterCallbacksWithNativeAccumulation(port);
                 }
             }
             catch { }

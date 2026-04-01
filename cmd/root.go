@@ -96,7 +96,7 @@ func Execute() error {
 		testSend := func(command string, params interface{}) (*client.CommandResponse, error) {
 			return client.Send(inst, command, params, 0)
 		}
-		resp, err = testCmd(subArgs, testSend, inst.Port)
+		resp, err = testCmd(subArgs, testSend, inst.Port, inst.ProjectPath)
 	case "exec":
 		subArgs = readStdinIfPiped(subArgs)
 		var params map[string]interface{}
@@ -510,8 +510,8 @@ Run Unity tests via the Test Runner API.
 
 Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
-  --filter <name>               Filter by namespace, class, or full test name
-                                Must be the full path (e.g. MyNamespace.MyClass)
+  --filter <name>               Filter tests by name (regex matched against full test name)
+  --assembly <names>            Comma-separated assembly names to run (e.g. MyTests,MyOtherTests)
 
 EditMode tests hold the connection open and return results directly.
 PlayMode tests return immediately and poll a results file (domain reload safe).
@@ -521,8 +521,9 @@ Requires the Unity Test Framework package (com.unity.test-framework).
 Examples:
   unity-cli test
   unity-cli test --mode PlayMode
-  unity-cli test --filter MyNamespace.MyTests
-  unity-cli test --mode EditMode --filter MyNamespace.MyTests.SpecificTest
+  unity-cli test --filter RateLimiterTests
+  unity-cli test --assembly NeonHorizon.Tests.DOTS
+  unity-cli test --assembly NeonHorizon.Tests.DOTS --filter RateLimiterTests
 `)
 	case "list":
 		fmt.Print(`Usage: unity-cli list

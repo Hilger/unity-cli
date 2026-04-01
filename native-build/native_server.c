@@ -456,3 +456,210 @@ EXPORT int native_server_send_error(int slot_id, int status_code, const char* js
 EXPORT int native_server_is_running(void) {
     return g_listen_sock != INVALID_SOCK && g_running;
 }
+
+/* ---- Native string set (deduplication) ---- */
+/* Simple hash set of strings. Used to deduplicate test results
+ * across domain reloads (Unity bug: TestFinished can fire twice). */
+
+#define SET_BUCKET_COUNT 512
+#define SET_MAX_ENTRIES  4096
+#define SET_KEY_SIZE     256
+
+typedef struct SetEntry {
+    char key[SET_KEY_SIZE];
+    struct SetEntry* next;
+} SetEntry;
+
+static SetEntry   g_set_pool[SET_MAX_ENTRIES];
+static int        g_set_pool_next = 0;
+static SetEntry*  g_set_buckets[SET_BUCKET_COUNT];
+static mutex_t    g_set_mutex;
+static int        g_set_initialized = 0;
+
+static void ensure_set_init(void) {
+    if (!g_set_initialized) {
+        MUTEX_INIT(&g_set_mutex);
+        memset(g_set_buckets, 0, sizeof(g_set_buckets));
+        g_set_pool_next = 0;
+        g_set_initialized = 1;
+    }
+}
+
+static unsigned int set_hash(const char* key) {
+    unsigned int h = 5381;
+    while (*key) h = ((h << 5) + h) + (unsigned char)*key++;
+    return h % SET_BUCKET_COUNT;
+}
+
+/*
+ * Add a string to the set. Returns 1 if newly added, 0 if already present.
+ */
+EXPORT int native_server_set_add(const char* key) {
+    ensure_set_init();
+    if (!key) return 0;
+
+    unsigned int bucket = set_hash(key);
+
+    MUTEX_LOCK(&g_set_mutex);
+
+    /* Check if already present */
+    for (SetEntry* e = g_set_buckets[bucket]; e; e = e->next) {
+        if (strncmp(e->key, key, SET_KEY_SIZE) == 0) {
+            MUTEX_UNLOCK(&g_set_mutex);
+            return 0; /* already exists */
+        }
+    }
+
+    /* Add new entry */
+    if (g_set_pool_next >= SET_MAX_ENTRIES) {
+        MUTEX_UNLOCK(&g_set_mutex);
+        return 0; /* pool exhausted */
+    }
+
+    SetEntry* entry = &g_set_pool[g_set_pool_next++];
+    strncpy(entry->key, key, SET_KEY_SIZE - 1);
+    entry->key[SET_KEY_SIZE - 1] = '\0';
+    entry->next = g_set_buckets[bucket];
+    g_set_buckets[bucket] = entry;
+
+    MUTEX_UNLOCK(&g_set_mutex);
+    return 1;
+}
+
+/*
+ * Clear the entire set.
+ */
+EXPORT void native_server_set_clear(void) {
+    ensure_set_init();
+    MUTEX_LOCK(&g_set_mutex);
+    memset(g_set_buckets, 0, sizeof(g_set_buckets));
+    g_set_pool_next = 0;
+    MUTEX_UNLOCK(&g_set_mutex);
+}
+
+/* ---- Persistent data buffer ---- */
+/* Simple key-value store that survives domain reloads.
+ * Keys and values are null-terminated strings.
+ * Used by the test runner to persist runId, startedAt, and
+ * accumulated test results across C# domain reloads. */
+
+#define MAX_DATA_ENTRIES 16
+#define MAX_KEY_SIZE     64
+#define MAX_VALUE_SIZE   (512 * 1024)  /* 512 KB — enough for test result JSON */
+
+typedef struct {
+    int  used;
+    char key[MAX_KEY_SIZE];
+    char value[MAX_VALUE_SIZE];
+    int  value_len;
+} DataEntry;
+
+static DataEntry g_data[MAX_DATA_ENTRIES];
+static mutex_t   g_data_mutex;
+static int       g_data_initialized = 0;
+
+static void ensure_data_init(void) {
+    if (!g_data_initialized) {
+        MUTEX_INIT(&g_data_mutex);
+        memset(g_data, 0, sizeof(g_data));
+        g_data_initialized = 1;
+    }
+}
+
+/*
+ * Store a value for the given key. Overwrites if key exists.
+ * Returns 1 on success, 0 if store is full.
+ */
+EXPORT int native_server_data_set(const char* key, const char* value, int value_len) {
+    ensure_data_init();
+    if (!key || !value) return 0;
+    if (value_len > MAX_VALUE_SIZE - 1) value_len = MAX_VALUE_SIZE - 1;
+
+    MUTEX_LOCK(&g_data_mutex);
+
+    /* Look for existing key or first free slot */
+    int target = -1;
+    int free_slot = -1;
+    for (int i = 0; i < MAX_DATA_ENTRIES; i++) {
+        if (g_data[i].used && strncmp(g_data[i].key, key, MAX_KEY_SIZE) == 0) {
+            target = i;
+            break;
+        }
+        if (!g_data[i].used && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+
+    if (target < 0) target = free_slot;
+    if (target < 0) {
+        MUTEX_UNLOCK(&g_data_mutex);
+        return 0; /* full */
+    }
+
+    g_data[target].used = 1;
+    strncpy(g_data[target].key, key, MAX_KEY_SIZE - 1);
+    g_data[target].key[MAX_KEY_SIZE - 1] = '\0';
+    memcpy(g_data[target].value, value, value_len);
+    g_data[target].value[value_len] = '\0';
+    g_data[target].value_len = value_len;
+
+    MUTEX_UNLOCK(&g_data_mutex);
+    return 1;
+}
+
+/*
+ * Read the value for the given key into buffer.
+ * Returns the value length (>0) on success, 0 if key not found.
+ */
+EXPORT int native_server_data_get(const char* key, char* buffer, int buffer_size) {
+    ensure_data_init();
+    if (!key || !buffer || buffer_size <= 0) return 0;
+
+    MUTEX_LOCK(&g_data_mutex);
+
+    for (int i = 0; i < MAX_DATA_ENTRIES; i++) {
+        if (g_data[i].used && strncmp(g_data[i].key, key, MAX_KEY_SIZE) == 0) {
+            int copy_len = g_data[i].value_len;
+            if (copy_len > buffer_size - 1) copy_len = buffer_size - 1;
+            memcpy(buffer, g_data[i].value, copy_len);
+            buffer[copy_len] = '\0';
+            MUTEX_UNLOCK(&g_data_mutex);
+            return copy_len;
+        }
+    }
+
+    MUTEX_UNLOCK(&g_data_mutex);
+    buffer[0] = '\0';
+    return 0;
+}
+
+/*
+ * Delete a key. Returns 1 if found and deleted, 0 if not found.
+ */
+EXPORT int native_server_data_delete(const char* key) {
+    ensure_data_init();
+    if (!key) return 0;
+
+    MUTEX_LOCK(&g_data_mutex);
+
+    for (int i = 0; i < MAX_DATA_ENTRIES; i++) {
+        if (g_data[i].used && strncmp(g_data[i].key, key, MAX_KEY_SIZE) == 0) {
+            g_data[i].used = 0;
+            MUTEX_UNLOCK(&g_data_mutex);
+            return 1;
+        }
+    }
+
+    MUTEX_UNLOCK(&g_data_mutex);
+    return 0;
+}
+
+/*
+ * Clear all data entries.
+ */
+EXPORT void native_server_data_clear(void) {
+    ensure_data_init();
+    MUTEX_LOCK(&g_data_mutex);
+    memset(g_data, 0, sizeof(g_data));
+    MUTEX_UNLOCK(&g_data_mutex);
+}

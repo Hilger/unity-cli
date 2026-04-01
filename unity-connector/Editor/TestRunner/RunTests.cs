@@ -17,9 +17,12 @@ namespace UnityCliConnector.TestRunner
         internal static readonly string StatusDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "status");
 
-        // SessionState keys — survive domain reloads within a Unity session
-        const string SK_TESTS     = "UnityCliConnector_Tests";      // JSON array of test entry objects
-        const string SK_STARTED   = "UnityCliConnector_TestStarted"; // ISO timestamp
+        // Native data keys — stored in native plugin memory, survives domain reloads.
+        // NK_STARTED and NK_RUNID are owned by StartAsyncRun (set once per run).
+        // NK_TESTS is a buffer flushed to disk by onFinished, then cleared.
+        const string NK_TESTS   = "cli_tests";
+        const string NK_STARTED = "cli_started";
+        const string NK_RUNID   = "cli_runid";
 
         public class Parameters
         {
@@ -52,72 +55,85 @@ namespace UnityCliConnector.TestRunner
 
             var filter = p.Get("filter", null);
             var assembly = p.Get("assembly", null);
+            var runId = p.Get("runId", null);
 
-            // Both modes use fire-and-forget: return immediately, write results to file.
-            StartAsyncRun(testMode, filter, assembly);
+            StartAsyncRun(testMode, filter, assembly, runId);
             return Task.FromResult<object>(new SuccessResponse("running", new { port = HttpServer.Port }));
         }
 
-        private static void StartAsyncRun(TestMode mode, string filter, string assembly = null)
+        private static void StartAsyncRun(TestMode mode, string filter, string assembly = null, string runId = null)
         {
             int port = HttpServer.Port;
 
-            // Clean up stale results and session state
+            // Clean up stale data
             try { string f = ResultsFilePath(port); if (File.Exists(f)) File.Delete(f); } catch { }
-            ClearSessionState();
+            NativeData.Delete(NK_TESTS);
+            NativeData.SetClear();
 
-            // Record start time
-            SessionState.SetString(SK_STARTED, DateTime.UtcNow.ToString("o"));
+            // Set run identity in native memory (survives domain reloads).
+            // Only StartAsyncRun writes these — they persist until the next run.
+            NativeData.Set(NK_STARTED, DateTime.UtcNow.ToString("o"));
+            NativeData.Set(NK_RUNID, runId ?? "");
 
-            // Mark pending (survives domain reloads)
+            // Clear progress and results files
+            try
+            {
+                var projectLogs = ProjectLogsDir();
+                Directory.CreateDirectory(projectLogs);
+                File.WriteAllText(Path.Combine(projectLogs, "TestProgress.json"), "[]");
+                File.WriteAllText(Path.Combine(projectLogs, "TestResults.json"), "");
+            }
+            catch { }
+
             TestRunnerState.MarkPending(port, filter, mode);
-
-            // Signal heartbeat
             Heartbeat.SetTestingState(true);
 
-            // Write initial progress file
-            WriteProgressFile("running");
-
-            // Register callbacks and execute tests
-            TestRunnerApi api = RegisterCallbacksWithSessionAccumulation(port);
+            TestRunnerApi api = RegisterCallbacksWithNativeAccumulation(port);
             api.Execute(new ExecutionSettings(BuildFilter(mode, filter, assembly)));
         }
 
         /// <summary>
-        /// Registers test callbacks that accumulate results in SessionState
-        /// and write incremental progress to Logs/TestResults.json after each test.
+        /// Creates a TestRunnerApi with callbacks that accumulate results in native memory.
+        /// After domain reloads, TestRunnerState calls this WITHOUT Execute to re-register.
         /// </summary>
-        /// <summary>
-        /// Creates a TestRunnerApi, registers callbacks that accumulate results in SessionState,
-        /// and returns the api instance so the caller can optionally call Execute().
-        /// After domain reloads, TestRunnerState calls this WITHOUT Execute — just re-registers callbacks.
-        /// </summary>
-        internal static TestRunnerApi RegisterCallbacksWithSessionAccumulation(int port)
+        internal static TestRunnerApi RegisterCallbacksWithNativeAccumulation(int port)
         {
+            if (s_ActiveCallbacks != null)
+            {
+                TestRunnerApi.UnregisterTestCallback(s_ActiveCallbacks);
+                s_ActiveCallbacks = null;
+            }
+
             TestRunnerApi api = ScriptableObject.CreateInstance<TestRunnerApi>();
             TestCallbacks callbacks = new TestCallbacks(
                 onResult: r =>
                 {
-                    CollectResultToSession(r);
-                    WriteProgressFile("running");
+                    CollectResult(r);
                 },
                 onFinished: _ =>
                 {
                     Object.DestroyImmediate(api);
+                    s_ActiveCallbacks = null;
                     TestRunnerState.ClearPending(port);
-                    WriteFinalResults(port);
-                    ClearSessionState();
+                    FlushResultsToFile(port);
                     Heartbeat.SetTestingState(false);
                 }
             );
 
+            s_ActiveCallbacks = callbacks;
             api.RegisterCallbacks(callbacks);
             return api;
         }
 
-        // --- SessionState accumulation (survives domain reloads) ---
+        static TestCallbacks s_ActiveCallbacks;
 
-        static void CollectResultToSession(ITestResultAdaptor result)
+        // --- Per-test result handling ---
+
+        /// <summary>
+        /// Called for each test result. Stores in native memory buffer and
+        /// appends to the progress file (append-only).
+        /// </summary>
+        static void CollectResult(ITestResultAdaptor result)
         {
             if (result.Test.IsSuite) return;
 
@@ -130,76 +146,85 @@ namespace UnityCliConnector.TestRunner
             if (result.TestStatus == TestStatus.Failed)
                 entry["message"] = result.Message ?? "";
 
-            var tests = LoadSessionTests();
+            // Deduplicate: Unity has a recurring bug where TestFinished fires
+            // twice for the same test after domain reloads (fixed in v1.4.5,
+            // v1.5.1, but has regressed multiple times historically).
+            // See: https://docs.unity3d.com/Packages/com.unity.test-framework@1.5/changelog/CHANGELOG.html#151---2025-02-26
+            if (!NativeData.SetAdd(result.Test.FullName))
+                return;
+
+            // Accumulate in native memory (survives domain reloads)
+            var tests = LoadNativeTests();
             tests.Add(entry);
-            SessionState.SetString(SK_TESTS, tests.ToString(Formatting.None));
-        }
+            NativeData.Set(NK_TESTS, tests.ToString(Formatting.None));
 
-        static JArray LoadSessionTests()
-        {
-            var json = SessionState.GetString(SK_TESTS, "[]");
-            try { return JArray.Parse(json); }
-            catch { return new JArray(); }
+            // Append to progress file (append-only, CLI polls this for progress)
+            AppendProgress(entry);
         }
-
-        static void ClearSessionState()
-        {
-            SessionState.EraseString(SK_TESTS);
-            SessionState.EraseString(SK_STARTED);
-        }
-
-        // --- File output ---
 
         /// <summary>
-        /// Writes incremental progress to the project-local Logs/TestResults.json.
-        /// Called after each test completes so external tools can read mid-run.
+        /// Appends a single test entry to Logs/TestProgress.json.
+        /// The file is a JSON array; we read, append, write back.
         /// </summary>
-        static void WriteProgressFile(string status)
+        static void AppendProgress(JObject entry)
         {
-            var tests = LoadSessionTests();
-            var startedStr = SessionState.GetString(SK_STARTED, null);
-
-            int passed = 0, failed = 0, skipped = 0;
-            foreach (var t in tests)
-            {
-                var s = t["status"]?.ToString();
-                if (s == "passed") passed++;
-                else if (s == "failed") failed++;
-                else skipped++;
-            }
-
-            var data = new JObject
-            {
-                ["status"]    = status,
-                ["startedAt"] = startedStr,
-                ["summary"] = new JObject
-                {
-                    ["passed"]  = passed,
-                    ["failed"]  = failed,
-                    ["skipped"] = skipped,
-                    ["total"]   = tests.Count
-                },
-                ["tests"] = tests
-            };
-
             try
             {
-                var projectLogs = Path.Combine(Application.dataPath, "..", "Logs");
-                Directory.CreateDirectory(projectLogs);
-                File.WriteAllText(
-                    Path.Combine(projectLogs, "TestResults.json"),
-                    data.ToString(Formatting.Indented));
+                var path = Path.Combine(ProjectLogsDir(), "TestProgress.json");
+                JArray arr;
+                if (File.Exists(path))
+                {
+                    var existing = File.ReadAllText(path);
+                    arr = string.IsNullOrEmpty(existing) ? new JArray() : JArray.Parse(existing);
+                }
+                else
+                {
+                    arr = new JArray();
+                }
+                arr.Add(entry);
+                File.WriteAllText(path, arr.ToString(Formatting.None));
             }
             catch { }
         }
 
-        /// <summary>
-        /// Writes final results to both the CLI polling path and the project-local path.
-        /// </summary>
-        static void WriteFinalResults(int port)
+        static JArray LoadNativeTests()
         {
-            var tests = LoadSessionTests();
-            var startedStr = SessionState.GetString(SK_STARTED, null);
+            var json = NativeData.Get(NK_TESTS) ?? "[]";
+            try { return JArray.Parse(json); }
+            catch { return new JArray(); }
+        }
+
+        // --- Final results (written once by onFinished) ---
+
+        /// <summary>
+        /// Flushes accumulated test results from native memory to disk.
+        /// Reads cli_tests, writes to TestResults.json and the legacy CLI polling file,
+        /// then clears cli_tests. Run identity (cli_runid, cli_started) is NOT cleared —
+        /// it persists until the next StartAsyncRun.
+        /// </summary>
+        static void FlushResultsToFile(int port)
+        {
+            var tests = LoadNativeTests();
+            var startedStr = NativeData.Get(NK_STARTED);
+            var runId = NativeData.Get(NK_RUNID);
+
+            // If cli_tests is empty, nothing to flush (already flushed or no tests ran).
+            // Don't overwrite the results file with empty data.
+            if (tests.Count == 0 && !string.IsNullOrEmpty(runId))
+            {
+                // Check if results file already has data for this run
+                try
+                {
+                    var existingPath = Path.Combine(ProjectLogsDir(), "TestResults.json");
+                    if (File.Exists(existingPath))
+                    {
+                        var existing = File.ReadAllText(existingPath);
+                        if (!string.IsNullOrEmpty(existing))
+                            return; // Already written, don't overwrite
+                    }
+                }
+                catch { }
+            }
 
             int passed = 0, failed = 0, skipped = 0;
             var failures = new List<string>();
@@ -214,7 +239,7 @@ namespace UnityCliConnector.TestRunner
                 else skipped++;
             }
 
-            // CLI polling file (legacy format expected by Go CLI)
+            // Legacy CLI polling file
             var cliData = new
             {
                 success = failed == 0,
@@ -223,7 +248,7 @@ namespace UnityCliConnector.TestRunner
                     : $"All {passed} test(s) passed.",
                 data = new
                 {
-                    total    = tests.Count,
+                    total = tests.Count,
                     passed,
                     failed,
                     skipped,
@@ -243,12 +268,13 @@ namespace UnityCliConnector.TestRunner
                 Debug.LogError($"[UnityCliConnector] Failed to write test results: {ex.Message}");
             }
 
-            // Project-local: full granular format with per-test entries
+            // Project-local results (CLI polls this with runId matching)
             var projectData = new JObject
             {
                 ["status"]      = "completed",
                 ["startedAt"]   = startedStr,
                 ["completedAt"] = DateTime.UtcNow.ToString("o"),
+                ["runId"]       = runId,
                 ["summary"] = new JObject
                 {
                     ["passed"]  = passed,
@@ -261,36 +287,43 @@ namespace UnityCliConnector.TestRunner
 
             try
             {
-                var projectLogs = Path.Combine(Application.dataPath, "..", "Logs");
+                var projectLogs = ProjectLogsDir();
                 Directory.CreateDirectory(projectLogs);
                 File.WriteAllText(
                     Path.Combine(projectLogs, "TestResults.json"),
                     projectData.ToString(Formatting.Indented));
             }
             catch { }
+
+            // Clear the test buffer (run identity persists until next StartAsyncRun)
+            NativeData.Delete(NK_TESTS);
         }
 
         internal static string ResultsFilePath(int port) =>
             Path.Combine(StatusDir, $"test-results-{port}.json");
+
+        static string ProjectLogsDir() =>
+            Path.Combine(Application.dataPath, "..", "Logs");
 
         internal static Filter BuildFilter(TestMode mode, string filterStr, string assemblyStr = null)
         {
             var f = new Filter { testMode = mode };
             if (!string.IsNullOrEmpty(filterStr))
             {
-                f.testNames  = new[] { filterStr };
                 f.groupNames = new[] { filterStr };
             }
             if (!string.IsNullOrEmpty(assemblyStr))
             {
-                f.assemblyNames = assemblyStr.Split(',');
+                var names = assemblyStr.Split(',');
+                for (int i = 0; i < names.Length; i++)
+                    names[i] = names[i].Trim();
+                f.assemblyNames = names;
                 Debug.Log($"[UnityCliConnector] Assembly filter set: [{string.Join(", ", f.assemblyNames)}]");
             }
             else
             {
                 Debug.Log("[UnityCliConnector] No assembly filter — running all tests");
             }
-            Debug.Log($"[UnityCliConnector] Filter: {f}");
             return f;
         }
 
