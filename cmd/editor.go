@@ -72,6 +72,16 @@ func editorCmd(args []string, send sendFn, port int) (*client.CommandResponse, e
 			}
 			hasErrors := waitForReady(port)
 			if hasErrors {
+				// Fetch compile errors inline so the user doesn't need a second command
+				errResp, errErr := send("read_logs", map[string]interface{}{
+					"type":  "error",
+					"lines": 20,
+				})
+				if errErr == nil && errResp != nil && errResp.Success {
+					errResp.Success = false
+					errResp.Message = "Compilation finished with errors."
+					return errResp, nil
+				}
 				return nil, fmt.Errorf("compilation finished with errors (check unity-cli console)")
 			}
 			resp.Message = "Refresh and compilation completed."

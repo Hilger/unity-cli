@@ -79,10 +79,13 @@
 #endif
 
 /* ---- Slot: one pending request or in-flight response ---- */
+#define SLOT_TIMEOUT_MS  30000   /* 30s — reap orphaned in-flight slots */
+
 typedef struct {
-    int      used;           /* 0=free, 1=has_request, 2=has_response */
+    int      used;           /* 0=free, 1=has_request, 2=in_flight (waiting for C# response) */
     int      slot_id;        /* unique id for this request */
     socket_t client_sock;    /* the accepted connection (kept open until response sent) */
+    int64_t  dispatched_at;  /* timestamp when slot entered used=2 (for timeout reaping) */
     char     request[MAX_REQUEST_SIZE];
     int      request_len;
     char     response[MAX_RESPONSE_SIZE];
@@ -97,6 +100,9 @@ static thread_t   g_thread;
 static mutex_t    g_mutex;
 static Slot       g_slots[MAX_PENDING];
 static int        g_next_id     = 1;
+
+/* ---- Forward declarations ---- */
+static int64_t get_timestamp_ms(void);
 
 /* ---- Platform helpers ---- */
 
@@ -232,6 +238,38 @@ static void* accept_thread(void* arg) {
         struct pollfd pfd = { g_listen_sock, POLLIN, 0 };
         int ready = poll(&pfd, 1, 200); /* 200ms timeout for shutdown check */
 #endif
+
+        /* Reap orphaned in-flight slots.
+         * If C# was awaiting a long operation and a domain reload killed the
+         * Task/callback, the slot stays at used=2 forever. Send 503 so the
+         * Go CLI can retry. */
+        {
+            int64_t now = get_timestamp_ms();
+            MUTEX_LOCK(&g_mutex);
+            for (int i = 0; i < MAX_PENDING; i++) {
+                if (g_slots[i].used == 2 &&
+                    g_slots[i].dispatched_at > 0 &&
+                    (now - g_slots[i].dispatched_at) > SLOT_TIMEOUT_MS)
+                {
+                    const char* body = "{\"success\":false,\"message\":\"Request timed out (domain reload)\"}";
+                    int body_len = (int)strlen(body);
+                    char header[256];
+                    int hdr_len = snprintf(header, sizeof(header),
+                        "HTTP/1.1 503 Service Unavailable\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Connection: close\r\n"
+                        "\r\n", body_len);
+                    send(g_slots[i].client_sock, header, hdr_len, 0);
+                    send(g_slots[i].client_sock, body, body_len, 0);
+                    CLOSESOCK(g_slots[i].client_sock);
+                    g_slots[i].client_sock = INVALID_SOCK;
+                    g_slots[i].used = 0;
+                }
+            }
+            MUTEX_UNLOCK(&g_mutex);
+        }
+
         if (ready <= 0) continue;
 
         struct sockaddr_in addr;
@@ -368,6 +406,7 @@ EXPORT int native_server_get_pending_request(char* buffer, int buffer_size) {
         memcpy(buffer, g_slots[best].request, copy_len);
         buffer[copy_len] = '\0';
         g_slots[best].used = 2; /* mark as in-flight (waiting for response) */
+        g_slots[best].dispatched_at = get_timestamp_ms();
         result_id = g_slots[best].slot_id;
     }
     MUTEX_UNLOCK(&g_mutex);
@@ -766,11 +805,14 @@ EXPORT int native_server_event_poll(int since_seq, char* buffer, int buffer_size
 
     MUTEX_LOCK(&g_event_mutex);
 
-    /* First pass: collect matching events sorted by seq */
+    /* Iterate from head (oldest entry) for correct sequence ordering.
+     * g_event_head points to the next-to-be-overwritten slot, which is
+     * the oldest entry in the ring. */
     int count = 0;
     int pos = 4; /* reserve 4 bytes for count header */
 
-    for (int i = 0; i < EVENT_RING_SIZE; i++) {
+    for (int j = 0; j < EVENT_RING_SIZE; j++) {
+        int i = (g_event_head + j) % EVENT_RING_SIZE;
         Event* e = &g_events[i];
         if (e->seq <= since_seq || e->seq == 0) continue;
 
@@ -918,10 +960,12 @@ EXPORT int native_server_log_read(int since_seq, int type_filter, int max_count,
 
     MUTEX_LOCK(&g_log_mutex);
 
+    /* Iterate from head (oldest entry) for correct sequence ordering. */
     int count = 0;
     int pos = 4; /* reserve for count header */
 
-    for (int i = 0; i < LOG_RING_SIZE; i++) {
+    for (int j = 0; j < LOG_RING_SIZE; j++) {
+        int i = (g_log_head + j) % LOG_RING_SIZE;
         LogEntry* e = &g_logs[i];
         if (e->seq <= since_seq || e->seq == 0) continue;
 
