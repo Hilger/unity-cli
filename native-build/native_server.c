@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 #ifdef _WIN32
   #include <windows.h>
@@ -65,9 +66,9 @@
 /* ---- Configuration ---- */
 #define DEFAULT_PORT       8090
 #define MAX_PORT_ATTEMPTS  10
-#define MAX_PENDING        64
-#define MAX_REQUEST_SIZE   (256 * 1024)  /* 256 KB per request */
-#define MAX_RESPONSE_SIZE  (1024 * 1024) /* 1 MB per response */
+#define MAX_PENDING        32
+#define MAX_REQUEST_SIZE   (1024 * 1024)       /* 1 MB per request */
+#define MAX_RESPONSE_SIZE  (2 * 1024 * 1024)   /* 2 MB per response */
 #define RECV_BUF_SIZE      (64 * 1024)
 
 /* ---- Export macros ---- */
@@ -148,8 +149,13 @@ static const char* find_http_body(const char* buf, int buf_len, int* body_len) {
 
 /* ---- Accept loop (runs on native thread) ---- */
 
+/* Static receive buffer — safe because handle_connection is only called
+ * from the single accept thread, never concurrently. Avoids stack overflow
+ * when MAX_REQUEST_SIZE exceeds the default pthread stack size (512KB). */
+static char s_recv_buf[MAX_REQUEST_SIZE];
+
 static void handle_connection(socket_t client) {
-    char buf[MAX_REQUEST_SIZE];
+    char *buf = s_recv_buf;
     int total = 0;
 
     /* Read until we have full headers + body */
@@ -543,9 +549,9 @@ EXPORT void native_server_set_clear(void) {
  * Used by the test runner to persist runId, startedAt, and
  * accumulated test results across C# domain reloads. */
 
-#define MAX_DATA_ENTRIES 16
+#define MAX_DATA_ENTRIES 32
 #define MAX_KEY_SIZE     64
-#define MAX_VALUE_SIZE   (512 * 1024)  /* 512 KB — enough for test result JSON */
+#define MAX_VALUE_SIZE   (1024 * 1024)  /* 1 MB — enough for large test result JSON */
 
 typedef struct {
     int  used;
@@ -662,4 +668,309 @@ EXPORT void native_server_data_clear(void) {
     MUTEX_LOCK(&g_data_mutex);
     memset(g_data, 0, sizeof(g_data));
     MUTEX_UNLOCK(&g_data_mutex);
+}
+
+/* ============================================================
+ * EVENT RING BUFFER
+ *
+ * C# pushes typed events (state changes, log messages, compile
+ * events, etc.) into this ring buffer via event_push(). The CLI
+ * polls events via event_poll(), which returns a packed binary
+ * protocol that C# deserializes into JSON.
+ *
+ * Binary protocol for event_poll output:
+ *   [4 bytes: count]
+ *   per event:
+ *     [4 bytes: seq] [4 bytes: type] [8 bytes: timestamp_ms]
+ *     [4 bytes: data_len] [data_len bytes: data]
+ * ============================================================ */
+
+#define EVENT_RING_SIZE  512
+#define EVENT_DATA_SIZE  4096
+
+typedef struct {
+    int      seq;            /* monotonically increasing, 0 = unused */
+    int      type;           /* event type (defined by C# EventType enum) */
+    int64_t  timestamp_ms;   /* Unix epoch milliseconds */
+    int      data_len;
+    char     data[EVENT_DATA_SIZE]; /* pre-serialized JSON from C# */
+} Event;
+
+static Event    g_events[EVENT_RING_SIZE];
+static int      g_event_head = 0;
+static int      g_event_seq  = 0;
+static mutex_t  g_event_mutex;
+static int      g_event_initialized = 0;
+
+static void ensure_event_init(void) {
+    if (!g_event_initialized) {
+        MUTEX_INIT(&g_event_mutex);
+        memset(g_events, 0, sizeof(g_events));
+        g_event_head = 0;
+        g_event_seq = 0;
+        g_event_initialized = 1;
+    }
+}
+
+static int64_t get_timestamp_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    int64_t t = ((int64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (t - 116444736000000000LL) / 10000;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#endif
+}
+
+/*
+ * Push a typed event with a data payload (pre-serialized JSON from C#).
+ * Returns the assigned sequence number, or -1 on error.
+ */
+EXPORT int native_server_event_push(int type, const char* data, int data_len) {
+    ensure_event_init();
+    if (data_len < 0) data_len = 0;
+
+    MUTEX_LOCK(&g_event_mutex);
+
+    int idx = g_event_head;
+    Event* e = &g_events[idx];
+
+    g_event_seq++;
+    e->seq = g_event_seq;
+    e->type = type;
+    e->timestamp_ms = get_timestamp_ms();
+
+    int copy_len = data_len < EVENT_DATA_SIZE - 1 ? data_len : EVENT_DATA_SIZE - 1;
+    if (data && copy_len > 0)
+        memcpy(e->data, data, copy_len);
+    e->data[copy_len] = '\0';
+    e->data_len = copy_len;
+
+    g_event_head = (idx + 1) % EVENT_RING_SIZE;
+
+    int result = e->seq;
+    MUTEX_UNLOCK(&g_event_mutex);
+    return result;
+}
+
+/*
+ * Poll events since since_seq (exclusive). Writes packed binary into buffer.
+ * Returns the number of events written, or -1 if buffer is too small for header.
+ */
+EXPORT int native_server_event_poll(int since_seq, char* buffer, int buffer_size) {
+    ensure_event_init();
+    if (!buffer || buffer_size < 4) return -1;
+
+    MUTEX_LOCK(&g_event_mutex);
+
+    /* First pass: collect matching events sorted by seq */
+    int count = 0;
+    int pos = 4; /* reserve 4 bytes for count header */
+
+    for (int i = 0; i < EVENT_RING_SIZE; i++) {
+        Event* e = &g_events[i];
+        if (e->seq <= since_seq || e->seq == 0) continue;
+
+        /* Each event needs: 4+4+8+4+data_len = 20 + data_len bytes */
+        int needed = 20 + e->data_len;
+        if (pos + needed > buffer_size) break;
+
+        memcpy(buffer + pos, &e->seq, 4); pos += 4;
+        memcpy(buffer + pos, &e->type, 4); pos += 4;
+        memcpy(buffer + pos, &e->timestamp_ms, 8); pos += 8;
+        memcpy(buffer + pos, &e->data_len, 4); pos += 4;
+        if (e->data_len > 0) {
+            memcpy(buffer + pos, e->data, e->data_len);
+            pos += e->data_len;
+        }
+        count++;
+    }
+
+    /* Write count at the beginning */
+    memcpy(buffer, &count, 4);
+
+    MUTEX_UNLOCK(&g_event_mutex);
+    return count;
+}
+
+/*
+ * Returns the current highest event sequence number (0 if no events).
+ */
+EXPORT int native_server_event_get_seq(void) {
+    ensure_event_init();
+    return g_event_seq;
+}
+
+/*
+ * Clear all events and reset sequence counter.
+ */
+EXPORT void native_server_event_clear(void) {
+    ensure_event_init();
+    MUTEX_LOCK(&g_event_mutex);
+    memset(g_events, 0, sizeof(g_events));
+    g_event_head = 0;
+    g_event_seq = 0;
+    MUTEX_UNLOCK(&g_event_mutex);
+}
+
+/* ============================================================
+ * LOG RING BUFFER
+ *
+ * Dedicated ring buffer for Unity console log messages.
+ * C# hooks Application.logMessageReceivedThreaded (thread-safe)
+ * and pushes log entries here. The read_logs CLI tool polls
+ * via log_read(), which returns packed binary.
+ *
+ * Binary protocol for log_read output:
+ *   [4 bytes: count]
+ *   per entry:
+ *     [4 bytes: seq] [4 bytes: log_type] [8 bytes: timestamp_ms]
+ *     [4 bytes: msg_len] [msg_len bytes: message]
+ *     [4 bytes: stack_len] [stack_len bytes: stacktrace]
+ * ============================================================ */
+
+#define LOG_RING_SIZE   512
+#define LOG_MSG_SIZE    2048
+#define LOG_STACK_SIZE  2048
+
+typedef struct {
+    int      seq;           /* 0 = unused */
+    int      log_type;      /* 0=Log, 1=Warning, 2=Error, 3=Exception, 4=Assert */
+    int64_t  timestamp_ms;
+    int      msg_len;
+    int      stack_len;
+    char     message[LOG_MSG_SIZE];
+    char     stacktrace[LOG_STACK_SIZE];
+} LogEntry;
+
+static LogEntry g_logs[LOG_RING_SIZE];
+static int      g_log_head = 0;
+static int      g_log_seq  = 0;
+static mutex_t  g_log_mutex;
+static int      g_log_initialized = 0;
+
+static void ensure_log_init(void) {
+    if (!g_log_initialized) {
+        MUTEX_INIT(&g_log_mutex);
+        memset(g_logs, 0, sizeof(g_logs));
+        g_log_head = 0;
+        g_log_seq = 0;
+        g_log_initialized = 1;
+    }
+}
+
+/*
+ * Push a log entry. Returns sequence number or -1 on error.
+ */
+EXPORT int native_server_log_push(int log_type,
+    const char* msg, int msg_len,
+    const char* stack, int stack_len)
+{
+    ensure_log_init();
+    if (msg_len < 0) msg_len = 0;
+    if (stack_len < 0) stack_len = 0;
+
+    MUTEX_LOCK(&g_log_mutex);
+
+    int idx = g_log_head;
+    LogEntry* e = &g_logs[idx];
+
+    g_log_seq++;
+    e->seq = g_log_seq;
+    e->log_type = log_type;
+    e->timestamp_ms = get_timestamp_ms();
+
+    int copy_msg = msg_len < LOG_MSG_SIZE - 1 ? msg_len : LOG_MSG_SIZE - 1;
+    if (msg && copy_msg > 0)
+        memcpy(e->message, msg, copy_msg);
+    e->message[copy_msg] = '\0';
+    e->msg_len = copy_msg;
+
+    int copy_stack = stack_len < LOG_STACK_SIZE - 1 ? stack_len : LOG_STACK_SIZE - 1;
+    if (stack && copy_stack > 0)
+        memcpy(e->stacktrace, stack, copy_stack);
+    e->stacktrace[copy_stack] = '\0';
+    e->stack_len = copy_stack;
+
+    g_log_head = (idx + 1) % LOG_RING_SIZE;
+
+    int result = e->seq;
+    MUTEX_UNLOCK(&g_log_mutex);
+    return result;
+}
+
+/*
+ * Read log entries since since_seq, with optional type filter bitmask.
+ * type_filter: bit0=Log, bit1=Warning, bit2=Error, bit3=Exception, bit4=Assert.
+ * Use 0 or -1 for all types.
+ * max_count: max entries to return (0 = no limit).
+ * Writes packed binary into buffer. Returns count or -1 if buffer too small.
+ */
+EXPORT int native_server_log_read(int since_seq, int type_filter, int max_count,
+    char* buffer, int buffer_size)
+{
+    ensure_log_init();
+    if (!buffer || buffer_size < 4) return -1;
+    if (type_filter == 0 || type_filter == -1) type_filter = 0x1F; /* all 5 types */
+
+    MUTEX_LOCK(&g_log_mutex);
+
+    int count = 0;
+    int pos = 4; /* reserve for count header */
+
+    for (int i = 0; i < LOG_RING_SIZE; i++) {
+        LogEntry* e = &g_logs[i];
+        if (e->seq <= since_seq || e->seq == 0) continue;
+
+        /* Check type filter bitmask */
+        if (!(type_filter & (1 << e->log_type))) continue;
+
+        /* Each entry: 4+4+8 + 4+msg_len + 4+stack_len = 24 + msg_len + stack_len */
+        int needed = 24 + e->msg_len + e->stack_len;
+        if (pos + needed > buffer_size) break;
+
+        memcpy(buffer + pos, &e->seq, 4); pos += 4;
+        memcpy(buffer + pos, &e->log_type, 4); pos += 4;
+        memcpy(buffer + pos, &e->timestamp_ms, 8); pos += 8;
+        memcpy(buffer + pos, &e->msg_len, 4); pos += 4;
+        if (e->msg_len > 0) {
+            memcpy(buffer + pos, e->message, e->msg_len);
+            pos += e->msg_len;
+        }
+        memcpy(buffer + pos, &e->stack_len, 4); pos += 4;
+        if (e->stack_len > 0) {
+            memcpy(buffer + pos, e->stacktrace, e->stack_len);
+            pos += e->stack_len;
+        }
+        count++;
+        if (max_count > 0 && count >= max_count) break;
+    }
+
+    memcpy(buffer, &count, 4);
+
+    MUTEX_UNLOCK(&g_log_mutex);
+    return count;
+}
+
+/*
+ * Returns the current highest log sequence number (0 if none).
+ */
+EXPORT int native_server_log_get_seq(void) {
+    ensure_log_init();
+    return g_log_seq;
+}
+
+/*
+ * Clear all log entries.
+ */
+EXPORT void native_server_log_clear(void) {
+    ensure_log_init();
+    MUTEX_LOCK(&g_log_mutex);
+    memset(g_logs, 0, sizeof(g_logs));
+    g_log_head = 0;
+    g_log_seq = 0;
+    MUTEX_UNLOCK(&g_log_mutex);
 }

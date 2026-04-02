@@ -19,7 +19,8 @@ namespace UnityCliConnector
     public static class HttpServer
     {
         const string LIB = "native_server";
-        const int REQUEST_BUFFER_SIZE = 256 * 1024;
+        const int REQUEST_BUFFER_SIZE = 1024 * 1024;
+        const int MAX_REQUESTS_PER_FRAME = 4;
 
         [DllImport(LIB)] static extern int native_server_get_port();
         [DllImport(LIB)] static extern int native_server_is_running();
@@ -29,6 +30,7 @@ namespace UnityCliConnector
         [DllImport(LIB)] static extern int native_server_send_error(int slotId, int statusCode, byte[] json, int jsonLen);
 
         static bool s_Registered;
+        static byte[] s_PollBuffer;
 
         static HttpServer()
         {
@@ -60,28 +62,40 @@ namespace UnityCliConnector
 
         /// <summary>
         /// Called ~60x/sec by EditorApplication.update.
-        /// Dequeues one request per frame from the native buffer and processes it.
+        /// Dequeues up to MAX_REQUESTS_PER_FRAME requests from the native buffer.
+        /// Uses a static buffer to avoid GC pressure.
         /// </summary>
         static void PollNative()
         {
             try
             {
                 if (native_server_is_running() == 0) return;
-                if (native_server_get_request_count() == 0) return;
             }
             catch
             {
                 return; // native plugin not loaded yet
             }
 
-            var buffer = new byte[REQUEST_BUFFER_SIZE];
-            int slotId = native_server_get_pending_request(buffer, buffer.Length);
-            if (slotId == 0) return;
+            if (s_PollBuffer == null || s_PollBuffer.Length != REQUEST_BUFFER_SIZE)
+                s_PollBuffer = new byte[REQUEST_BUFFER_SIZE];
 
-            // Parse the JSON body
-            string bodyStr = Encoding.UTF8.GetString(buffer).TrimEnd('\0');
+            for (int i = 0; i < MAX_REQUESTS_PER_FRAME; i++)
+            {
+                try
+                {
+                    if (native_server_get_request_count() == 0) return;
+                }
+                catch { return; }
 
-            ProcessRequest(slotId, bodyStr);
+                int slotId = native_server_get_pending_request(s_PollBuffer, s_PollBuffer.Length);
+                if (slotId == 0) return;
+
+                int bodyLen = Array.IndexOf(s_PollBuffer, (byte)0);
+                if (bodyLen < 0) bodyLen = s_PollBuffer.Length;
+                string bodyStr = Encoding.UTF8.GetString(s_PollBuffer, 0, bodyLen);
+
+                ProcessRequest(slotId, bodyStr);
+            }
         }
 
         static async void ProcessRequest(int slotId, string body)

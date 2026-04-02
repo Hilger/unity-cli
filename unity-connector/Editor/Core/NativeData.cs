@@ -11,7 +11,7 @@ namespace UnityCliConnector
     public static class NativeData
     {
         const string LIB = "native_server";
-        const int MAX_VALUE_SIZE = 512 * 1024;
+        const int MAX_VALUE_SIZE = 1024 * 1024;
 
         [DllImport(LIB, CharSet = CharSet.Ansi)]
         static extern int native_server_data_set(string key, byte[] value, int valueLen);
