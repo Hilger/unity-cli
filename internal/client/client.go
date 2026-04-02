@@ -69,15 +69,27 @@ func ScanInstances() ([]Instance, error) {
 }
 
 // FindByPort scans instance files and returns the one matching the given port.
+// Prefers alive instances over stopped ones when multiple files share a port
+// (e.g., a stale worktree instance file).
 func FindByPort(port int) (*Instance, error) {
 	instances, err := ScanInstances()
 	if err != nil {
 		return nil, err
 	}
+	var fallback *Instance
 	for _, inst := range instances {
 		if inst.Port == port {
-			return &inst, nil
+			if inst.State != "stopped" {
+				return &inst, nil
+			}
+			if fallback == nil {
+				cp := inst
+				fallback = &cp
+			}
 		}
+	}
+	if fallback != nil {
+		return fallback, nil
 	}
 	return nil, fmt.Errorf("no instance on port %d", port)
 }

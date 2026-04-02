@@ -277,6 +277,7 @@ Usage: unity-cli <command> [subcommand] [options]
 
 Editor Control:
   editor play [--wait]          Enter play mode (--wait blocks until fully entered)
+  editor play --monitor         Enter play mode and monitor until stopped
   editor stop                   Exit play mode
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh                Refresh asset database
@@ -373,13 +374,24 @@ Subcommands:
   play [--wait]       Enter play mode
                       --wait blocks until Unity fully enters play mode.
                       Without --wait, returns immediately after requesting.
+  play --monitor      Enter play mode and monitor the session until stopped.
+                      Streams errors in real-time via HTTP polling.
+                      Session tracking is enabled automatically.
+                      Exits with code 1 if errors occurred, 0 otherwise.
   stop                Exit play mode. No effect if not playing.
   pause               Toggle pause. Only works during play mode.
   refresh             Refresh AssetDatabase (reimport changed assets).
     --compile         Recompile scripts and wait until compilation finishes.
 
+Session Tracking:
+  Play mode sessions are tracked by default when started via CLI.
+  Errors, exceptions, and warnings are captured to Logs/PlaySession.json.
+  Use 'play_session --params {"action":"status"}' to query live state.
+  Use 'play_session --params {"action":"results"}' to read the last session.
+
 Examples:
   unity-cli editor play --wait
+  unity-cli editor play --monitor
   unity-cli editor stop
   unity-cli editor refresh --compile
 `)
