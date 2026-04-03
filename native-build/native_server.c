@@ -160,6 +160,47 @@ static const char* find_http_body(const char* buf, int buf_len, int* body_len) {
  * when MAX_REQUEST_SIZE exceeds the default pthread stack size (512KB). */
 static char s_recv_buf[MAX_REQUEST_SIZE];
 
+/* Reap the oldest orphaned in-flight slot. Called only when no free slot is
+ * available — a last resort to recover from domain-reload-orphaned requests.
+ * Returns the index of the reaped slot, or -1 if nothing was reapable.
+ * Caller must hold g_mutex. */
+static int reap_oldest_orphan(void) {
+    int64_t now = get_timestamp_ms();
+    int oldest = -1;
+    int64_t oldest_time = 0;
+
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (g_slots[i].used == 2 &&
+            g_slots[i].dispatched_at > 0 &&
+            (now - g_slots[i].dispatched_at) > SLOT_TIMEOUT_MS)
+        {
+            if (oldest < 0 || g_slots[i].dispatched_at < oldest_time) {
+                oldest = i;
+                oldest_time = g_slots[i].dispatched_at;
+            }
+        }
+    }
+
+    if (oldest >= 0) {
+        const char* body = "{\"success\":false,\"message\":\"Request timed out (slot reclaimed)\"}";
+        int body_len = (int)strlen(body);
+        char header[256];
+        int hdr_len = snprintf(header, sizeof(header),
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n", body_len);
+        send(g_slots[oldest].client_sock, header, hdr_len, 0);
+        send(g_slots[oldest].client_sock, body, body_len, 0);
+        CLOSESOCK(g_slots[oldest].client_sock);
+        g_slots[oldest].client_sock = INVALID_SOCK;
+        g_slots[oldest].used = 0;
+    }
+
+    return oldest;
+}
+
 static void handle_connection(socket_t client) {
     char *buf = s_recv_buf;
     int total = 0;
@@ -186,28 +227,38 @@ static void handle_connection(socket_t client) {
         if (body) {
             int header_size = (int)(body - buf);
             if (total >= header_size + body_len) {
-                /* Complete request received — queue it */
+                /* Complete request received — find a slot */
                 MUTEX_LOCK(&g_mutex);
-                int queued = 0;
+                int target = -1;
+
+                /* First: look for a free slot */
                 for (int i = 0; i < MAX_PENDING; i++) {
                     if (g_slots[i].used == 0) {
-                        g_slots[i].used = 1;
-                        g_slots[i].slot_id = g_next_id++;
-                        g_slots[i].client_sock = client;
-                        /* Store just the body (the JSON payload) */
-                        int copy_len = body_len < MAX_REQUEST_SIZE - 1 ? body_len : MAX_REQUEST_SIZE - 1;
-                        memcpy(g_slots[i].request, body, copy_len);
-                        g_slots[i].request[copy_len] = '\0';
-                        g_slots[i].request_len = copy_len;
-                        g_slots[i].response_len = 0;
-                        queued = 1;
+                        target = i;
                         break;
                     }
                 }
+
+                /* No free slot — try reaping an orphaned in-flight slot */
+                if (target < 0) {
+                    target = reap_oldest_orphan();
+                }
+
+                if (target >= 0) {
+                    g_slots[target].used = 1;
+                    g_slots[target].slot_id = g_next_id++;
+                    g_slots[target].client_sock = client;
+                    g_slots[target].dispatched_at = 0;
+                    int copy_len = body_len < MAX_REQUEST_SIZE - 1 ? body_len : MAX_REQUEST_SIZE - 1;
+                    memcpy(g_slots[target].request, body, copy_len);
+                    g_slots[target].request[copy_len] = '\0';
+                    g_slots[target].request_len = copy_len;
+                    g_slots[target].response_len = 0;
+                }
                 MUTEX_UNLOCK(&g_mutex);
 
-                if (!queued) {
-                    /* All slots full — reject with 503 */
+                if (target < 0) {
+                    /* All slots full and none reapable — reject */
                     const char* reject =
                         "HTTP/1.1 503 Service Unavailable\r\n"
                         "Content-Length: 0\r\n"
@@ -238,37 +289,6 @@ static void* accept_thread(void* arg) {
         struct pollfd pfd = { g_listen_sock, POLLIN, 0 };
         int ready = poll(&pfd, 1, 200); /* 200ms timeout for shutdown check */
 #endif
-
-        /* Reap orphaned in-flight slots.
-         * If C# was awaiting a long operation and a domain reload killed the
-         * Task/callback, the slot stays at used=2 forever. Send 503 so the
-         * Go CLI can retry. */
-        {
-            int64_t now = get_timestamp_ms();
-            MUTEX_LOCK(&g_mutex);
-            for (int i = 0; i < MAX_PENDING; i++) {
-                if (g_slots[i].used == 2 &&
-                    g_slots[i].dispatched_at > 0 &&
-                    (now - g_slots[i].dispatched_at) > SLOT_TIMEOUT_MS)
-                {
-                    const char* body = "{\"success\":false,\"message\":\"Request timed out (domain reload)\"}";
-                    int body_len = (int)strlen(body);
-                    char header[256];
-                    int hdr_len = snprintf(header, sizeof(header),
-                        "HTTP/1.1 503 Service Unavailable\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: %d\r\n"
-                        "Connection: close\r\n"
-                        "\r\n", body_len);
-                    send(g_slots[i].client_sock, header, hdr_len, 0);
-                    send(g_slots[i].client_sock, body, body_len, 0);
-                    CLOSESOCK(g_slots[i].client_sock);
-                    g_slots[i].client_sock = INVALID_SOCK;
-                    g_slots[i].used = 0;
-                }
-            }
-            MUTEX_UNLOCK(&g_mutex);
-        }
 
         if (ready <= 0) continue;
 
